@@ -1,0 +1,80 @@
+name: QA Web Hotfix Watch
+
+  on:
+    schedule:
+      - cron: '*/10 * * * *'
+    workflow_dispatch:
+
+  jobs:
+    watch:
+      runs-on: ubuntu-latest
+      env:
+        TARGET_REPO: 'LeKiosqueFr/web-website'   
+        BASE_BRANCH: 'main'
+      steps:
+        - name: Restore state
+          uses: actions/cache/restore@v4
+          with:
+            path: .state
+            key: hotfix-watch-${{ github.run_id }}
+            restore-keys: hotfix-watch-
+
+        - uses: actions/github-script@v7
+          env:
+            SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          with:
+            github-token: ${{ secrets.GH_READ_TOKEN }}
+            script: |
+              const fs = require('fs');
+              const target = process.env.TARGET_REPO, base = process.env.BASE_BRANCH;
+              const [owner, repo] = target.split('/');
+              const webhook = process.env.SLACK_WEBHOOK_URL;
+
+              let since;
+              try { since = fs.readFileSync('.state/last_run.txt','utf8').trim(); } catch {}
+              if (!since) since = new Date(Date.now() - 15*60*1000).toISOString();
+              const runStart = new Date().toISOString();
+
+              const post = (blocks) => fetch(webhook, { method:'POST',
+                headers:{'Content-Type':'application/json'}, body: JSON.stringify({ blocks }) });
+              const btn = (url,text) => ({ type:'actions',
+                elements:[{ type:'button', text:{type:'plain_text',text}, url }] });
+
+              // 1) newly OPENED PRs -> heads-up
+              const opened = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${target} is:pr is:open base:${base} created:>=${since}`, per_page: 50 });
+              for (const pr of opened.data.items) {
+                const type = /hotfix/i.test(pr.title) ? 'Hotfix'
+                  : (pr.title.match(/^\s*(fix|feat|feature|bugfix|patch)\b/i)?.[1] ?? 'PR');
+                await post([
+                  { type:'section', text:{ type:'mrkdwn',
+                    text:`:eyes: *New ${type} PR (Web)* — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
+                         `by *${pr.user.login}* → \`${base}\` · :hourglass_flowing_sand: *QA review needed*` } },
+                  btn(pr.html_url,'Review the PR') ]);
+              }
+
+              // 2) recently MERGED PRs -> escalate if NO QA approval
+              const merged = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${target} is:pr is:merged base:${base} merged:>=${since}`, per_page: 50 });
+              for (const item of merged.data.items) {
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: item.number });
+                const reviews = await github.paginate(github.rest.pulls.listReviews,
+                  { owner, repo, pull_number: item.number });
+                const approvals = reviews.filter(r => r.state === 'APPROVED');
+                if (approvals.length) continue;
+                await post([
+                  { type:'section', text:{ type:'mrkdwn',
+                    text:`:rotating_light: *Merged to \`${base}\` without QA approval (Web)* — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
+                         `by *${pr.user.login}* · ${pr.changed_files} files · :speech_balloon: *0 approvals*` } },
+                  btn(pr.html_url,'Open the PR') ]);
+              }
+
+              fs.mkdirSync('.state', { recursive: true });
+              fs.writeFileSync('.state/last_run.txt', runStart);
+
+        - name: Save state
+          if: always()
+          uses: actions/cache/save@v4
+          with:
+            path: .state
+            key: hotfix-watch-${{ github.run_id }}
