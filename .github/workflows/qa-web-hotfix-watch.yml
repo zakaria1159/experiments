@@ -1,4 +1,4 @@
-name: QA Web Hotfix Watch
+  name: QA Web Hotfix Watch
 
   on:
     schedule:
@@ -9,7 +9,7 @@ name: QA Web Hotfix Watch
     watch:
       runs-on: ubuntu-latest
       env:
-        TARGET_REPO: 'LeKiosqueFr/web-website'   
+        TARGET_REPO: 'LeKiosqueFr/web-website'
         BASE_BRANCH: 'main'
       steps:
         - name: Restore state
@@ -40,7 +40,6 @@ name: QA Web Hotfix Watch
               const btn = (url,text) => ({ type:'actions',
                 elements:[{ type:'button', text:{type:'plain_text',text}, url }] });
 
-              // 1) newly OPENED PRs -> heads-up
               const opened = await github.rest.search.issuesAndPullRequests({
                 q: `repo:${target} is:pr is:open base:${base} created:>=${since}`, per_page: 50 });
               for (const pr of opened.data.items) {
@@ -53,7 +52,6 @@ name: QA Web Hotfix Watch
                   btn(pr.html_url,'Review the PR') ]);
               }
 
-              // 2) recently MERGED PRs -> escalate if NO QA approval
               const merged = await github.rest.search.issuesAndPullRequests({
                 q: `repo:${target} is:pr is:merged base:${base} merged:>=${since}`, per_page: 50 });
               for (const item of merged.data.items) {
