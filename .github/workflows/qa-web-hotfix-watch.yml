@@ -33,6 +33,7 @@
               let since;
               try { since = fs.readFileSync('.state/last_run.txt','utf8').trim(); } catch {}
               if (!since) since = new Date(Date.now() - 15*60*1000).toISOString();
+              since = new Date(Date.now() - 2*24*60*60*1000).toISOString();
               const runStart = new Date().toISOString();
 
               const post = (blocks) => fetch(webhook, { method:'POST',
