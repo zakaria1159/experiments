@@ -68,8 +68,8 @@
                 if (approvals.length) continue;
                 await post([
                   { type:'section', text:{ type:'mrkdwn',
-                    text:`:rotating_light: *Merged to \`${base}\` without QA approval (Web)* — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
-                         `by *${pr.user.login}* · ${pr.changed_files} files · :speech_balloon: *0 approvals*` } },
+                    text:`:bell: *Merged to \`${base}\` — QA review pending (Web)* — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
+                         `by *${pr.user.login}* · ${pr.changed_files} files · :mag: *needs a QA check*` } },
                   btn(pr.html_url,'Open the PR') ]);
               }
 
