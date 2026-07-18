@@ -43,14 +43,19 @@
 
               const opened = await github.rest.search.issuesAndPullRequests({
                 q: `repo:${target} is:pr is:open base:${base} created:>=${since}`, per_page: 50 });
-              for (const pr of opened.data.items) {
-                const type = /hotfix/i.test(pr.title) ? 'Hotfix'
-                  : (pr.title.match(/^\s*(fix|feat|feature|bugfix|patch)\b/i)?.[1] ?? 'PR');
+              for (const item of opened.data.items) {
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: item.number });
+                const isHotfix = /hotfix/i.test(pr.title) || pr.head.ref.toLowerCase().startsWith('hotfix');
+                const type = isHotfix ? 'Hotfix'
+                  : (pr.title.match(/^\s*(fix|feat|feature|bugfix|patch)\b/i)?.[1]?.replace(/^./,c=>c.toUpperCase()) ?? 'PR');
+                const head = isHotfix
+                  ? ':rotating_light: *HOTFIX PR (Web) — needs QA now*'
+                  : `:new: *New ${type} PR (Web)*`;
                 await post([
                   { type:'section', text:{ type:'mrkdwn',
-                    text:`:eyes: *New ${type} PR (Web)* — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
-                         `by *${pr.user.login}* → \`${base}\` · :hourglass_flowing_sand: *QA review needed*` } },
-                  btn(pr.html_url,'Review the PR') ]);
+                    text:`${head} — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
+                         `by *${pr.user.login}* → \`${base}\` · ${pr.changed_files} files · :hourglass_flowing_sand: *QA review needed*` } },
+                  btn(pr.html_url, isHotfix ? 'Review NOW' : 'Review the PR') ]);
               }
 
               const merged = await github.rest.search.issuesAndPullRequests({
