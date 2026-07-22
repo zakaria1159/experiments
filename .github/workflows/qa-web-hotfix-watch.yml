@@ -1,84 +1,420 @@
-  name: QA Web Hotfix Watch
+# Goes in your `experiments` repo at: .github/workflows/qa-web-hotfix-watch.yml
+#
+# Watches LeKiosqueFr/web-website and posts QA-relevant activity to Slack:
+#   1) Opened hotfix PRs (loud)
+#   2) PRs merged to main without a QA approval
+#   3) Deploy workflow finishing on a version TAG (*-staging / *-preprod / *-prod)
+#      -> this is the release-candidate signal, the web equivalent of Bitrise's :droid:
+#      -> includes a changelog vs. the previous tag on the SAME channel
+#   4) Playwright Tests failing (restores the "merged with red checks" detection)
+#
+# WHY TAGS: hotfix-8.2.8 / 8.2.8-staging / 8.2.8-prod are git TAGS, not branches.
+# The previous version polled repos.listBranches, which cannot see them at all.
+# Hotfix branches are also deleted on merge, so branch polling missed them anyway.
+#
+# Secrets on the experiments repo:
+#   GH_READ_TOKEN     fine-grained PAT on LeKiosqueFr/web-website
+#                     REQUIRED scopes: Metadata:read, Pull requests:read, Contents:read,
+#                                      Actions:read   <-- NEW, needed for sections 3 & 4
+#                     Without Actions:read, sections 3 & 4 self-skip with a warning.
+#   SLACK_WEBHOOK_URL Slack incoming webhook
+#
+# FIRST RUN seeds state silently (no Slack flood). Use the manual "Run workflow"
+# button with lookback_minutes to force a replay window.
 
-  on:
-    schedule:
-      - cron: '*/10 * * * *'
-    workflow_dispatch:
+name: QA Web Hotfix Watch
 
-  jobs:
-    watch:
-      runs-on: ubuntu-latest
-      env:
-        TARGET_REPO: 'LeKiosqueFr/web-website'
-        BASE_BRANCH: 'main'
-      steps:
-        - name: Restore state
-          uses: actions/cache/restore@v4
-          with:
-            path: .state
-            key: hotfix-watch-${{ github.run_id }}
-            restore-keys: hotfix-watch-
+on:
+  schedule:
+    - cron: '*/10 * * * *'    # GitHub throttles scheduled runs to ~hourly; that's expected
+  workflow_dispatch:
+    inputs:
+      lookback_minutes:
+        description: 'Ignore saved state and look back this many minutes (e.g. 1440 = last day)'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Print messages to the job log instead of posting to Slack'
+        type: boolean
+        required: false
+        default: false
+      max_messages:
+        description: 'Cap Slack messages this run (blank = no cap). Use when replaying history.'
+        required: false
+        default: ''
 
-        - uses: actions/github-script@v7
-          env:
-            SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          with:
-            github-token: ${{ secrets.GH_READ_TOKEN }}
-            script: |
-              const fs = require('fs');
-              const target = process.env.TARGET_REPO, base = process.env.BASE_BRANCH;
-              const [owner, repo] = target.split('/');
-              const webhook = process.env.SLACK_WEBHOOK_URL;
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO: 'LeKiosqueFr/web-website'
+      DEPLOY_WORKFLOW: 'Deploy'
+      TEST_WORKFLOW: 'Playwright Tests'
+      # Channels worth waking QA for. 'dev' is deliberately excluded - too noisy.
+      ALERT_CHANNELS: 'staging,preprod,prod'
+      ALERT_TEST_FAILURES: 'true'
+      CHANGELOG_MAX: '15'      # commit lines per Slack message before "+N more"
+      OVERLAP_MINUTES: '30'    # query window overlap; dedup-by-id keeps it quiet
 
-              let since;
-              try { since = fs.readFileSync('.state/last_run.txt','utf8').trim(); } catch {}
-              if (!since) since = new Date(Date.now() - 15*60*1000).toISOString();
-              since = new Date(Date.now() - 2*24*60*60*1000).toISOString();
-              const runStart = new Date().toISOString();
+    steps:
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          # v2 prefix: the state format changed from a bare timestamp to JSON.
+          key: qa-watch-v2-${{ github.run_id }}
+          restore-keys: qa-watch-v2-
 
-              const post = (blocks) => fetch(webhook, { method:'POST',
-                headers:{'Content-Type':'application/json'}, body: JSON.stringify({ blocks }) });
-              const btn = (url,text) => ({ type:'actions',
-                elements:[{ type:'button', text:{type:'plain_text',text}, url }] });
+      - uses: actions/github-script@v7
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LOOKBACK_MINUTES: ${{ inputs.lookback_minutes }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_MESSAGES: ${{ inputs.max_messages }}
+        with:
+          github-token: ${{ secrets.GH_READ_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const target  = process.env.TARGET_REPO;
+            const [owner, repo] = target.split('/');
+            const webhook = process.env.SLACK_WEBHOOK_URL;
+            const DEPLOY_WF = process.env.DEPLOY_WORKFLOW;
+            const TEST_WF   = process.env.TEST_WORKFLOW;
+            const CHANNELS  = new Set(process.env.ALERT_CHANNELS.split(',').map(s => s.trim()));
+            const MAX_CL    = parseInt(process.env.CHANGELOG_MAX, 10);
+            const OVERLAP   = parseInt(process.env.OVERLAP_MINUTES, 10) * 60000;
 
-              const opened = await github.rest.search.issuesAndPullRequests({
-                q: `repo:${target} is:pr is:open base:${base} created:>=${since}`, per_page: 50 });
-              for (const item of opened.data.items) {
-                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: item.number });
-                const isHotfix = /hotfix/i.test(pr.title) || pr.head.ref.toLowerCase().startsWith('hotfix');
-                const type = isHotfix ? 'Hotfix'
-                  : (pr.title.match(/^\s*(fix|feat|feature|bugfix|patch)\b/i)?.[1]?.replace(/^./,c=>c.toUpperCase()) ?? 'PR');
+            // Tag shapes, matching deploy.yml in the target repo.
+            const CHANNEL_RE = /^(\d+\.\d+\.\d+)-(dev|staging|preprod|prod)$/;
+            const HOTFIX_RE  = /^hotfix[-\/]/i;
+
+            // ---------------------------------------------------------------- state
+            const STATE_FILE = '.state/state.json';
+            const EMPTY = { since: null, prOpened: [], prMerged: [], runs: [], deployedTags: [] };
+            let saved = { ...EMPTY };
+            try { saved = { ...EMPTY, ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) }; } catch {}
+
+            const override  = parseInt(process.env.LOOKBACK_MINUTES || '', 10);
+            const runStart  = new Date();
+            const firstRun  = !saved.since && !Number.isFinite(override);
+
+            let since = Number.isFinite(override)
+              ? new Date(runStart - override * 60000)
+              : (saved.since ? new Date(saved.since) : new Date(runStart - OVERLAP));
+
+            // Query further back than `since`. The GitHub API (and the old search
+            // index) can surface an item late; without overlap that item is lost
+            // forever once `since` advances past it. Dedup-by-id absorbs the repeats.
+            const windowStart = new Date(since.getTime() - OVERLAP);
+
+            const seen = {
+              prOpened: new Set(saved.prOpened),
+              prMerged: new Set(saved.prMerged),
+              runs:     new Set(saved.runs),
+              deployedTags: new Set(saved.deployedTags),
+            };
+
+            // First run: record what already exists, post nothing.
+            const quiet = firstRun;
+            if (quiet) core.notice('First run - seeding state silently. Re-run manually with lookback_minutes to replay.');
+
+            // ---------------------------------------------------------------- slack
+            const dryRun = process.env.DRY_RUN === 'true';
+            if (dryRun) core.notice('DRY RUN - messages go to this log, not to Slack.');
+
+            // Cap for manual history replays. Suppressed items are still marked
+            // seen, so a later run will not re-post them.
+            const maxMessages = parseInt(process.env.MAX_MESSAGES || '', 10);
+            let suppressed = 0;
+
+            let posted = 0, slackErrors = 0;
+            async function post(text, blocks) {
+              if (quiet) return;
+              if (Number.isFinite(maxMessages) && posted >= maxMessages) { suppressed++; return; }
+              if (dryRun) {
+                posted++;
+                core.info('--- would post to Slack ---\n' +
+                  blocks.filter(b => b.type === 'section').map(b => b.text.text).join('\n'));
+                return;
+              }
+              const res = await fetch(webhook, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text, blocks }),   // `text` = notification fallback
+              });
+              if (!res.ok) {
+                slackErrors++;
+                core.warning(`Slack POST failed ${res.status}: ${await res.text()}`);
+              } else {
+                posted++;
+              }
+            }
+            const sect = (md) => ({ type: 'section', text: { type: 'mrkdwn', text: md } });
+            const btns = (...pairs) => ({
+              type: 'actions',
+              elements: pairs.map(([url, label]) => ({
+                type: 'button', text: { type: 'plain_text', text: label }, url,
+              })),
+            });
+
+            // A section that lacks token permission should warn, not fail the run.
+            let hardFailure = null;
+            async function section(name, fn) {
+              try { await fn(); }
+              catch (e) {
+                if ([401, 403, 404].includes(e.status)) {
+                  core.warning(`[${name}] skipped - GH_READ_TOKEN lacks access (${e.status}). ${e.message}`);
+                } else {
+                  hardFailure = `[${name}] ${e.message}`;
+                  core.error(`[${name}] ${e.stack || e.message}`);
+                }
+              }
+            }
+
+            // ------------------------------------------------------- 1) opened PRs
+            // pulls.list, not search: the search index lags and would drop alerts.
+            await section('opened PRs', async () => {
+              const { data: open } = await github.rest.pulls.list({
+                owner, repo, state: 'open', sort: 'created', direction: 'desc', per_page: 100 });
+
+              for (const p of open) {
+                if (new Date(p.created_at) < windowStart) break;   // list is sorted, stop early
+                if (seen.prOpened.has(p.number)) continue;
+
+                const isHotfix = HOTFIX_RE.test(p.head.ref) || /hotfix/i.test(p.title);
+                const toMain   = p.base.ref === 'main';
+                if (!isHotfix && !toMain) continue;                // feature PRs -> release-* are not QA's cue
+
+                seen.prOpened.add(p.number);
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: p.number });
                 const head = isHotfix
-                  ? ':rotating_light: *HOTFIX PR (Web) — needs QA now*'
-                  : `:new: *New ${type} PR (Web)*`;
-                await post([
-                  { type:'section', text:{ type:'mrkdwn',
-                    text:`${head} — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
-                         `by *${pr.user.login}* → \`${base}\` · ${pr.changed_files} files · :hourglass_flowing_sand: *QA review needed*` } },
-                  btn(pr.html_url, isHotfix ? 'Review NOW' : 'Review the PR') ]);
+                  ? ':rotating_light: *HOTFIX PR - needs QA now*'
+                  : ':new: *New PR targeting `main`*';
+                await post(
+                  `${isHotfix ? 'HOTFIX' : 'New'} PR #${pr.number}: ${pr.title}`,
+                  [ sect(`${head} - <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n` +
+                         `by *${pr.user.login}* · \`${pr.head.ref}\` → \`${pr.base.ref}\` · ` +
+                         `${pr.changed_files} files · :hourglass_flowing_sand: *QA review needed*`),
+                    btns([pr.html_url, isHotfix ? 'Review NOW' : 'Review the PR']) ]);
               }
+            });
 
-              const merged = await github.rest.search.issuesAndPullRequests({
-                q: `repo:${target} is:pr is:merged base:${base} merged:>=${since}`, per_page: 50 });
-              for (const item of merged.data.items) {
-                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: item.number });
+            // ------------------------------ 2) merged without a QA approval
+            await section('merged PRs', async () => {
+              const { data: closed } = await github.rest.pulls.list({
+                owner, repo, state: 'closed', sort: 'updated', direction: 'desc', per_page: 100 });
+
+              for (const p of closed) {
+                if (!p.merged_at) continue;
+                if (new Date(p.merged_at) < windowStart) continue;
+                if (seen.prMerged.has(p.number)) continue;
+
+                const isHotfix = HOTFIX_RE.test(p.head.ref) || /hotfix/i.test(p.title);
+                if (!isHotfix && p.base.ref !== 'main') continue;
+
                 const reviews = await github.paginate(github.rest.pulls.listReviews,
-                  { owner, repo, pull_number: item.number });
-                const approvals = reviews.filter(r => r.state === 'APPROVED');
-                if (approvals.length) continue;
-                await post([
-                  { type:'section', text:{ type:'mrkdwn',
-                    text:`:bell: *Merged to \`${base}\` — QA review pending (Web)* — <${pr.html_url}|#${pr.number}> \`${pr.title}\`\n`+
-                         `by *${pr.user.login}* · ${pr.changed_files} files · :mag: *needs a QA check*` } },
-                  btn(pr.html_url,'Open the PR') ]);
+                  { owner, repo, pull_number: p.number, per_page: 100 });
+                seen.prMerged.add(p.number);
+                if (reviews.some(r => r.state === 'APPROVED')) continue;
+
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: p.number });
+                await post(
+                  `Merged without QA review: #${pr.number} ${pr.title}`,
+                  [ sect(`:bell: *Merged \`${pr.head.ref}\` → \`${pr.base.ref}\` - QA review pending* - ` +
+                         `<${pr.html_url}|#${pr.number}> \`${pr.title}\`\n` +
+                         `by *${pr.user.login}* · ${pr.changed_files} files · :mag: *needs a QA check*`),
+                    btns([pr.html_url, 'Open the PR']) ]);
               }
+            });
 
-              fs.mkdirSync('.state', { recursive: true });
-              fs.writeFileSync('.state/last_run.txt', runStart);
+            // ------------------------------------------------- workflow run fetch
+            // Shared by sections 3 and 4. Pages back only as far as the window needs.
+            async function recentRuns() {
+              const out = [];
+              for (let page = 1; page <= 5; page++) {
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner, repo, per_page: 100, page });
+                if (!data.workflow_runs.length) break;
+                out.push(...data.workflow_runs);
+                const oldest = data.workflow_runs[data.workflow_runs.length - 1];
+                if (new Date(oldest.created_at) < windowStart) break;
+              }
+              return out;
+            }
 
-        - name: Save state
-          if: always()
-          uses: actions/cache/save@v4
-          with:
-            path: .state
-            key: hotfix-watch-${{ github.run_id }}
+            // ------------------------------------------------------- changelog
+            const cmpSemver = (a, b) => {
+              const pa = a.split('-')[0].split('.').map(Number);
+              const pb = b.split('-')[0].split('.').map(Number);
+              for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+              return 0;
+            };
+
+            let tagCache = null;
+            async function allTags() {
+              if (!tagCache) {
+                const refs = await github.paginate(github.rest.git.listMatchingRefs,
+                  { owner, repo, ref: 'tags/', per_page: 100 });
+                tagCache = refs.map(r => r.ref.replace('refs/tags/', ''));
+              }
+              return tagCache;
+            }
+
+            // Diff against the previous tag on the SAME channel, so a staging deploy
+            // shows "what's new on staging" rather than drifting against prod.
+            async function changelog(tag, channel) {
+              const tags = await allTags();
+              const sameChannel = tags
+                .filter(n => { const m = CHANNEL_RE.exec(n); return m && m[2] === channel; })
+                .sort(cmpSemver);
+              const idx = sameChannel.indexOf(tag);
+              if (idx <= 0) return null;
+              const prev = sameChannel[idx - 1];
+
+              const { data: cmp } = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${prev}...${tag}` });
+
+              const NOISE = /^(merge |chore:\s*bump\b|---+$|co-authored-by:)/i;
+              const subjects = [];
+              const tickets = new Set();
+              for (const c of cmp.commits) {
+                const lines = c.commit.message.split('\n');
+                const subject = lines[0].trim();
+                if (NOISE.test(subject)) continue;
+                for (const t of subject.match(/\b(?:FEWB|QA)-\d+\b/g) || []) tickets.add(t);
+                if (!subjects.includes(subject)) subjects.push(subject);
+
+                // Squash merges ("Hotfix 8.2.7 (#343)") bury the real changes in the
+                // body as bullets. That list IS the QA test scope - pull it up.
+                if (/\(#\d+\)\s*$/.test(subject)) {
+                  const inner = lines.slice(1)
+                    .map(l => (l.match(/^\s*[*-]\s+(.+?)\s*$/) || [])[1])
+                    .filter(Boolean)
+                    .filter(l => !NOISE.test(l));
+                  for (const l of inner.slice(0, 8)) {
+                    for (const t of l.match(/\b(?:FEWB|QA)-\d+\b/g) || []) tickets.add(t);
+                    const indented = `    ◦ ${l}`;
+                    if (!subjects.includes(indented)) subjects.push(indented);
+                  }
+                }
+              }
+              return { prev, subjects, tickets: [...tickets], url: cmp.html_url, total: cmp.commits.length };
+            }
+
+            function renderChangelog(cl) {
+              if (!cl) return '\n_No previous tag on this channel to diff against._';
+              if (!cl.subjects.length) return `\n_No functional commits since \`${cl.prev}\` (${cl.total} total)._`;
+              // Indented sub-bullets already carry their own marker.
+              const shown = cl.subjects.slice(0, MAX_CL)
+                .map(s => s.startsWith('    ') ? s : `• ${s}`).join('\n');
+              const more  = cl.subjects.length > MAX_CL
+                ? `\n_… +${cl.subjects.length - MAX_CL} more lines — see the full compare_` : '';
+              const tix   = cl.tickets.length ? `\n:label: ${cl.tickets.join(', ')}` : '';
+              return `\n\n*Changes since \`${cl.prev}\`* (${cl.total} commits)\n${shown}${more}${tix}`;
+            }
+
+            // ------------------------------- 3) Deploy finished on a version tag
+            await section('deploys', async () => {
+              const runs = await recentRuns();
+              const deploys = runs
+                .filter(r => r.name === DEPLOY_WF && r.status === 'completed')
+                .filter(r => new Date(r.updated_at) >= windowStart)
+                .filter(r => !seen.runs.has(r.id))
+                .reverse();                                   // oldest first, so Slack reads chronologically
+
+              for (const r of deploys) {
+                const m = CHANNEL_RE.exec(r.head_branch || '');   // for tag pushes this is the tag name
+                if (!m) continue;
+                const [, version, channel] = m;
+                if (!CHANNELS.has(channel)) continue;
+                seen.runs.add(r.id);
+
+                const ok = r.conclusion === 'success';
+                const label = channel.toUpperCase();
+                let head, cue;
+                if (!ok) {
+                  head = `:x: *Deploy to ${label} FAILED - \`${version}\`*`;
+                  cue  = ':warning: *nothing to test yet - deploy did not complete*';
+                } else if (channel === 'prod') {
+                  head = `:ship: *\`${version}\` is LIVE on PRODUCTION*`;
+                  cue  = ':eyes: *post-release check*';
+                } else {
+                  head = `:rocket: *\`${version}\` deployed to ${label}*`;
+                  cue  = ':test_tube: *release candidate - QA can start testing*';
+                }
+
+                // Same tag deployed again (retry, or a re-run of the workflow).
+                // Still worth saying, but the changelog is identical - don't repeat it.
+                const isRedeploy = seen.deployedTags.has(r.head_branch);
+                seen.deployedTags.add(r.head_branch);
+
+                const cl = (ok && !isRedeploy) ? await changelog(r.head_branch, channel) : null;
+                const buttons = [[r.html_url, 'Open the deploy run']];
+                if (cl) buttons.push([cl.url, 'Full compare']);
+
+                await post(
+                  `${ok ? 'Deployed' : 'Deploy FAILED'} ${version} to ${label}`,
+                  [ sect(`${head}${isRedeploy && ok ? ' _(re-deploy — same tag, no new changes)_' : ''}\n` +
+                         `${DEPLOY_WF} <${r.html_url}|#${r.run_number}> · tag \`${r.head_branch}\` · ` +
+                         `by *${r.actor?.login ?? 'unknown'}* · ${cue}` +
+                         (isRedeploy && ok ? '' : renderChangelog(cl))),
+                    btns(...buttons) ]);
+              }
+            });
+
+            // ------------------------------------- 4) Playwright Tests failing
+            // This is the signal lost when Checks:read was unavailable on the PAT -
+            // Actions:read exposes the same conclusion via the workflow run.
+            if (process.env.ALERT_TEST_FAILURES === 'true') {
+              await section('test failures', async () => {
+                const runs = await recentRuns();
+                const failed = runs
+                  .filter(r => r.name === TEST_WF && r.status === 'completed' && r.conclusion === 'failure')
+                  .filter(r => new Date(r.updated_at) >= windowStart)
+                  .filter(r => !seen.runs.has(r.id))
+                  .reverse();
+
+                for (const r of failed) {
+                  seen.runs.add(r.id);
+                  const onMain   = r.head_branch === 'main';
+                  const isHotfix = HOTFIX_RE.test(r.head_branch || '');
+                  const loud     = onMain || isHotfix;
+                  const prLink   = (r.pull_requests || [])
+                    .map(pr => `<${r.repository?.html_url ?? `https://github.com/${target}`}/pull/${pr.number}|#${pr.number}>`)
+                    .join(' ');
+
+                  await post(
+                    `Playwright FAILED on ${r.head_branch}`,
+                    [ sect(`${loud ? ':red_circle:' : ':warning:'} *${TEST_WF} failed on \`${r.head_branch}\`*` +
+                           `${loud ? ' - :rotating_light: *this is a release branch*' : ''}\n` +
+                           `<${r.html_url}|run #${r.run_number}> · commit \`${(r.head_sha || '').slice(0, 7)}\` · ` +
+                           `by *${r.actor?.login ?? 'unknown'}*` +
+                           `${prLink ? ` · PR ${prLink}` : ''}\n` +
+                           `\`${(r.head_commit?.message || '').split('\n')[0]}\``),
+                      btns([r.html_url, 'Open the failing run']) ]);
+                }
+              });
+            }
+
+            // ---------------------------------------------------------------- save
+            const cap = (arr, n = 400) => arr.slice(-n);
+            fs.mkdirSync('.state', { recursive: true });
+            fs.writeFileSync(STATE_FILE, JSON.stringify({
+              since:    runStart.toISOString(),
+              prOpened: cap([...seen.prOpened]),
+              prMerged: cap([...seen.prMerged]),
+              runs:     cap([...seen.runs]),
+              deployedTags: cap([...seen.deployedTags], 100),
+            }, null, 2));
+
+            core.info(`window ${windowStart.toISOString()} → ${runStart.toISOString()} | ` +
+              `posted ${posted} | suppressed ${suppressed} | slack errors ${slackErrors}`);
+            if (suppressed) core.notice(`${suppressed} message(s) suppressed by max_messages - they are marked seen and will not re-post.`);
+            if (hardFailure) core.setFailed(hardFailure);
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: qa-watch-v2-${{ github.run_id }}
